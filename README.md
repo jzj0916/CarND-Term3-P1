@@ -16,6 +16,7 @@ The car should stay within the lanes and avoid exceeding a maximum acceleration 
 ### Demo
 
 Please click on the link below to see a demo of the vehicle driving around on the simulator track.
+
 [Demo video](https://youtu.be/8ER7H1pEDnQ)
 
 
