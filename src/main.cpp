@@ -5,11 +5,11 @@
 #include <iostream>
 #include <thread>
 #include <vector>
+#include <map>
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
 #include "json.hpp"
 #include "spline.h"
-#include "vehicle.hpp"
 
 using namespace std;
 
@@ -36,10 +36,13 @@ string hasData(string s) {
   return "";
 }
 
+
 double distance(double x1, double y1, double x2, double y2)
 {
 	return sqrt((x2-x1)*(x2-x1)+(y2-y1)*(y2-y1));
 }
+
+
 int ClosestWaypoint(double x, double y, const vector<double> &maps_x, const vector<double> &maps_y)
 {
 
@@ -202,14 +205,22 @@ int main() {
   	map_waypoints_dy.push_back(d_y);
   }
 
-  // the lane to drive
+
+  // the start lane; lanes are 0, 1, 2 from left to right
   int lane = 1;
+  // map of available lanes
+  std::map <int, bool> lanes_map = {{0, true}, {1, true}, {2, true}};
+
   // the reference speed in mph !
   double ref_v = 0.0;
-
+  // target velocity
   const double kTargetV = 49.5;
+  double optimal_v = kTargetV; // used to follow traffic ahead if no lane change possible
+  // safe distance to other vehicles ahead and behind; in meters
+  const double kSafeDist = 30.0;
+  const double kSafeDistBehind = 10.0;
 
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy, &lane, &ref_v, &kTargetV](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
+  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy, &lane, &ref_v, &optimal_v, &lanes_map, &kTargetV, &kSafeDist, &kSafeDistBehind](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                      uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
@@ -243,9 +254,6 @@ int main() {
           	double end_path_s = j[1]["end_path_s"];
           	double end_path_d = j[1]["end_path_d"];
 
-          	// Sensor Fusion Data, a list of all other cars on the same side of the road.
-          	vector< vector<double> > sensor_fusion = j[1]["sensor_fusion"];
-
             int prev_size = previous_path_x.size();
 
             // set current Frenet s pose to the prev calculated path end s,
@@ -255,57 +263,80 @@ int main() {
               car_s = end_path_s;
             }
 
+            // Sensor Fusion Data, a list of all other cars on the same side of the road.
+            vector< vector<double> > sensor_fusion = j[1]["sensor_fusion"];
+
+            // flag to slow down if no change is possible
+            bool accel = false;
+
             bool prox_warn = false;
+            // initially all lanes are available to drive
+            for (auto &lne : lanes_map) {
+              lne.second = true;
+            } // for
 
             for (int i = 0; i < sensor_fusion.size(); i++) {
-              // only consider cars in ego lane
-              double obj_d = sensor_fusion[i][6]; // d values of cars
-              if (obj_d < (2 + 4 * lane + 2) && obj_d > (2 + 4 * lane - 2) ) {
-                // collect all the coordinates of the object
-                double obj_x = sensor_fusion[i][3];
-                double obj_y = sensor_fusion[i][4];
-                double obj_speed = std::sqrt( obj_x * obj_x + obj_y * obj_y);
-                double obj_s = sensor_fusion[i][5];
+              // collect all the coordinates of the object
+              double obj_x = sensor_fusion[i][3];
+              double obj_y = sensor_fusion[i][4];
+              double obj_speed = std::sqrt( obj_x * obj_x + obj_y * obj_y);
+              double obj_s = sensor_fusion[i][5];
 
-                // project object s value out, as using previous path
-                // 0.02 = 20 milliseconds
-                // idea is to predict where the object will be the next frame
-                obj_s += ((double)prev_size * 0.02 * obj_speed);
-                //check if object is in front of ego vehicle and
-                // distance is less than the safe distance
-                if ( (obj_s > car_s) && ((obj_s - car_s) < 30) ) {
+              // project object s value out, as using previous path
+              // 0.02 = 20 milliseconds
+              // idea is to predict where the object will be the next frame
+              obj_s += ((double)prev_size * 0.02 * obj_speed);
+              // is the car in the in ego lane
+              double obj_d = sensor_fusion[i][6]; // d values of cars
+
+              // the lane in which the vehicle is in
+              int obj_lane = (int)std::floor((obj_d / 4.0));
+              // std::cout << "Obj speed: " << obj_speed << "Ego speed: " << car_speed << std::endl;
+
+              // check if vehicle is in the same lane as the ego vehicle
+              //(obj_d < (2 + 4 * lane + 2) && obj_d > (2 + 4 * lane - 2) ) {
+              if (obj_lane == lane) {
+                // is the distance is less than the safe distance
+                if ( (obj_s > car_s) && ((obj_s - car_s) < kSafeDist) ){
                   // too close to object in front, proximity warning
                   prox_warn = true;
+                  lanes_map[lane] = false; // the current lane is not available
+                  // track speed of vehicle ahead
+                  optimal_v = obj_speed * 2.24; //convert to mph
+                } // if
 
+              } else if ((obj_s > car_s) && (obj_s - car_s) < kSafeDist) {
+                lanes_map[obj_lane] = false;
+              } else if ((obj_s < car_s) && (car_s - obj_s) < kSafeDistBehind){
+                lanes_map[obj_lane] = false;
 
-                  // TODO:
-
-                  // CHANGE LANE LOGIC
-
-
-                  // END
-
-
-
-
-                } // if obj_s
-              } // if obj_d
+              } // if else if
             }// for
 
 
-            // handle speed based on objects ahead
-
-            // TODO: if KL match the speed of the vehicle ahead (safe speed for the lane) ??
-            // Or instead of matching the speed, maintain safe distance!!
-            // while PLCL PLCR:
-            // match position and speed of "gap" to change lane
-
             if (prox_warn) {
-              ref_v -= 0.224; // decelerate with 5 ms^2
-            } else if (ref_v < kTargetV) {
-              ref_v += 0.224; // accelerate with 5 ms^2
-            }
+              // Change lane logic:
+              if (lane > 0 && lanes_map[lane - 1]) {
+                // try going left
+                lane -= 1;
+              } else if (lane < 2 && lanes_map[lane + 1]) {
+                // try going right
+                lane += 1;
+              } else {
+                // decelerate with 5 ms^2 (to match velocity of vehicle ahead)
+                accel = false;
+                // ref_v -= 0.3;//0.224;
+              } // if
 
+            // no proximity warning, try to maintain target speed:
+            } else {//if (ref_v < kTargetV){
+              optimal_v = kTargetV;
+              accel = true;
+              // ref_v += 0.3;// 0.224; // accelerate with 5 ms^2
+            } // if
+
+
+            // COMPUTE TRAJECTORY
             // create list of widely spaced (x,y) waypoints
             vector<double> pts_x;
             vector<double> pts_y;
@@ -361,11 +392,11 @@ int main() {
 
             for (int i = 0; i < pts_x.size(); i++) {
               // transform coordinates to car coordinates (car reference frame)
-              // shift car reference angle to 0 degrees
+              // shift coordinates to car x = 0 and y = 0
               double shift_x = pts_x[i] - ref_x;
               double shift_y = pts_y[i] - ref_y;
               double rot_angle = 0.0 - ref_yaw;
-              // rotate
+              // rotate angle to 0 degrees
               pts_x[i] = (shift_x * std::cos(rot_angle) - shift_y * std::sin(rot_angle));
               pts_y[i] = (shift_x * std::sin(rot_angle) + shift_y * std::cos(rot_angle));
 
@@ -400,6 +431,12 @@ int main() {
             // fill up rest of path after filling it with prev points
             // here output is always 50 points
             for (int i = 0; i < 50 - previous_path_x.size(); i ++) {
+              // check optimal velocity and accelerate or slow down to match it
+              if (accel && ref_v < optimal_v) {
+                ref_v += 0.224;
+              } else {
+                ref_v -= 0.224;
+              }
               // divide by 2.24 to get from mph to meters per second;
               double N = (target_dist / (0.02 * ref_v / 2.24 ) );
               double x_point = x_add_on + (target_x) / N;
